@@ -385,6 +385,69 @@ const toPerPayAmount = (amount, expenseFrequency, payFrequency) => {
 const toWeeklyAmount = (amount, frequency) => ((parseFloat(amount) || 0) * expenseAnnualFactor(frequency)) / 52;
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
+
+// ── Allocation history helpers ──────────────────────────────────────────────
+// Important: bucket balances should NOT be recalculated using today's allocation
+// percentages for every past payslip. Allocations are rules for NEW income.
+// To avoid changing the Supabase schema, allocation periods are stored inside
+// the existing user_settings.pay JSON object as pay.allocationPeriods.
+const cleanAllocations = (allocs = {}) => Object.fromEntries(
+  BUCKET_KEYS_GLOBAL.map(k => [k, parseFloat(allocs[k]) || 0])
+);
+
+const dayBeforeISO = (iso) => {
+  if (!iso || iso <= "0000-00-00") return null;
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0, 10);
+};
+
+const getAllocationPeriods = (data) => {
+  const current = cleanAllocations(data?.settings?.allocations || {});
+  const periods = data?.pay?.allocationPeriods;
+  if (Array.isArray(periods) && periods.length) {
+    return periods
+      .filter(p => p && p.startDate && p.allocations)
+      .map(p => ({ ...p, allocations: cleanAllocations(p.allocations) }))
+      .sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
+  }
+  return [{ id: "default-current", startDate: "0000-00-00", endDate: null, allocations: current }];
+};
+
+const getAllocationForDate = (data, date) => {
+  const periods = getAllocationPeriods(data);
+  const hit = [...periods].reverse().find(p =>
+    String(date || "0000-00-00") >= String(p.startDate || "0000-00-00") &&
+    (!p.endDate || String(date || "0000-00-00") <= String(p.endDate))
+  );
+  return cleanAllocations(hit?.allocations || data?.settings?.allocations || {});
+};
+
+const getAllocatedIncomeForBucket = (data, bucketKey, afterDate = "0000-00-00") => {
+  return (data?.incomeEntries || [])
+    .filter(e => String(e.date || "0000-00-00") > String(afterDate || "0000-00-00"))
+    .reduce((sum, e) => {
+      const alloc = getAllocationForDate(data, e.date);
+      return sum + ((parseFloat(e.net) || 0) * ((parseFloat(alloc[bucketKey]) || 0) / 100));
+    }, 0);
+};
+
+const getLiveBucketBalance = (data, bucketKey) => {
+  const snapshotDate = data?.startingBalances?.snapshotDate || "0000-00-00";
+  const start = parseFloat(data?.startingBalances?.[bucketKey]) || 0;
+  const allocated = getAllocatedIncomeForBucket(data, bucketKey, snapshotDate);
+  const spent = (data?.expenses || [])
+    .filter(e => e.bucket === bucketKey && String(e.date || "0000-00-00") > String(snapshotDate))
+    .reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+  return start + allocated - spent;
+};
+
+const getCurrentAllocationPeriodLabel = (data) => {
+  const periods = getAllocationPeriods(data);
+  const open = [...periods].reverse().find(p => !p.endDate) || periods[periods.length - 1];
+  return open?.startDate && open.startDate !== "0000-00-00" ? `Active since ${fmtDate(open.startDate)}` : "Current rule";
+};
+
 // useData is provided by Supabase hook above
 
 function StatCard({ label, value, sub, color }) {
@@ -716,26 +779,46 @@ function Dashboard({ data }) {
     );
   };
 
-  // ── Build live monthly data — prefer monthlyReports when available ──────
+  // ── Build monthly data — selected Monthly Close reports are the source of truth ──────
   const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const portfolioValue = data.portfolio.reduce((s, h) => s + h.units * h.price, 0);
 
-  // Months that have a locked monthly report take priority
-  const reportedMonths = new Set((data.monthlyReports || []).map(r => r.month));
+  // Monthly reports (locked months) become chart data points. The first report is a baseline,
+  // so it is shown in total net worth but excluded from growth bar charts.
+  const reportedMonthData = (data.monthlyReports || [])
+    .map(r => ({
+      month: r.month,
+      label: r.label,
+      total: r.netTotal,
+      stock: r.stockTotal,
+      gold: r.goldTotal,
+      crypto: r.cryptoTotal,
+      investGrowth: r.investGrowth ?? null,
+      balanceGrowth: r.balanceGrowth ?? null,
+      growthPct: r.growthPct ?? null,
+      isBaseline: r.isBaseline || false,
+    }))
+    .sort((a, b) => a.month.localeCompare(b.month));
 
-  // Get all months from live income entries after snapshot (excluding reported ones)
+  const lastLockedMonth = reportedMonthData[reportedMonthData.length - 1]?.month || null;
+  const lastLockedTotal = reportedMonthData[reportedMonthData.length - 1]?.total ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].total;
+  const lastLockedStock = reportedMonthData[reportedMonthData.length - 1]?.stock ?? portfolioValue;
+  const lastLockedGold = reportedMonthData[reportedMonthData.length - 1]?.gold ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].gold;
+  const lastLockedCrypto = reportedMonthData[reportedMonthData.length - 1]?.crypto ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].crypto;
+
+  // Months that have a locked monthly report take priority
+  const reportedMonths = new Set(reportedMonthData.map(r => r.month));
+
+  // Get live months after the latest locked close only, so older months do not duplicate reports
   const liveMonths = [...new Set(
     data.incomeEntries
-      .filter(e => e.date > SNAPSHOT && !reportedMonths.has(e.date.slice(0, 7)))
+      .filter(e => e.date > SNAPSHOT && !reportedMonths.has(e.date.slice(0, 7)) && (!lastLockedMonth || e.date.slice(0, 7) > lastLockedMonth))
       .map(e => e.date.slice(0, 7))
   )].sort();
 
-  // For each live month, compute net worth = last known total + cumulative income - cumulative expenses
   const liveMonthData = (() => {
-    const baseTotal = MONTHLY_DATA[MONTHLY_DATA.length - 1].total;
-    const baseStock = portfolioValue; // use live portfolio value
-    let runningTotal = baseTotal;
-    let prevTotal = baseTotal;
+    let runningTotal = lastLockedTotal;
+    let prevTotal = lastLockedTotal;
 
     return liveMonths.map(m => {
       const monthIncome = data.incomeEntries
@@ -756,9 +839,9 @@ function Dashboard({ data }) {
         month: m,
         label,
         total: Math.round(runningTotal),
-        stock: baseStock,
-        gold: MONTHLY_DATA[MONTHLY_DATA.length - 1].gold,
-        crypto: MONTHLY_DATA[MONTHLY_DATA.length - 1].crypto,
+        stock: lastLockedStock,
+        gold: lastLockedGold,
+        crypto: lastLockedCrypto,
         investGrowth: null,
         balanceGrowth: Math.round(balanceGrowth),
         growthPct: parseFloat(growthPct.toFixed(2)),
@@ -767,26 +850,14 @@ function Dashboard({ data }) {
     });
   })();
 
-  // Monthly reports (locked months) become chart data points
-  const reportedMonthData = (data.monthlyReports || []).map(r => ({
-    month: r.month,
-    label: r.label,
-    total: r.netTotal,
-    stock: r.stockTotal,
-    gold: r.goldTotal,
-    crypto: r.cryptoTotal,
-    investGrowth: r.investGrowth,
-    balanceGrowth: r.balanceGrowth,
-    growthPct: r.growthPct,
-  }));
+  // Use locked reports when they exist; otherwise keep the empty starter point.
+  const rawMonthlyData = reportedMonthData.length > 0 ? [...reportedMonthData, ...liveMonthData] : [...MONTHLY_DATA, ...liveMonthData];
+  const allMonthlyData = rawMonthlyData.map((m, i) => i === 0 ? { ...m, investGrowth: null, balanceGrowth: null, growthPct: null, isBaseline: true } : m);
 
-  // Combined: hardcoded history + locked reports + live unreported months
-  const allMonthlyData = [...MONTHLY_DATA, ...reportedMonthData, ...liveMonthData];
-
-  const shortLabel = (m) => m.label.replace(/-\d{4}$/, "").replace(/^(\w+)-(\d{2})$/, (_, mon, yr) => mon + "-" + yr).replace("-25","").replace("-26","").replace("-27","");
+  const shortLabel = (m) => (m.label || "").replace(/-\d{4}$/, "").replace(/^(\w+)-(\d{2})$/, (_, mon, yr) => mon + "-" + yr).replace("-25","").replace("-26","").replace("-27","");
   const shortLabels = allMonthlyData.map(shortLabel);
-  const investBars  = allMonthlyData.slice(1).map(m => ({ label: shortLabel(m), value: m.investGrowth || 0 }));
-  const balanceBars = allMonthlyData.slice(1).map(m => ({ label: shortLabel(m), value: m.balanceGrowth || 0 }));
+  const investBars  = allMonthlyData.slice(1).filter(m => m.investGrowth !== null && m.investGrowth !== undefined).map(m => ({ label: shortLabel(m), value: m.investGrowth || 0 }));
+  const balanceBars = allMonthlyData.slice(1).filter(m => m.balanceGrowth !== null && m.balanceGrowth !== undefined).map(m => ({ label: shortLabel(m), value: m.balanceGrowth || 0, growthPct: m.growthPct }));
   const tableRows   = allMonthlyData;
 
   return (
@@ -887,7 +958,7 @@ function Dashboard({ data }) {
           <BarChart bars={balanceBars} H={140} />
         </svg>
         <div style={{ display: "flex", marginTop: 10, gap: 2 }}>
-          {allMonthlyData.slice(1).map((m, i) => {
+          {balanceBars.map((m, i) => {
             const pos = (m.growthPct || 0) >= 0;
             return (
               <div key={i} style={{ flex: 1, textAlign: "center" }}>
@@ -954,7 +1025,7 @@ function WeeklyUpdate({ data, update, dbHelpers }) {
   const [totalCash, setTotalCash] = useState("");
   const [cashSaved, setCashSaved] = useState(false);
 
-  const allocs = data.settings.allocations;
+  const allocs = getAllocationForDate(data, date);
   const net = parseFloat(pay) || 0;
 
   const BUCKET_LABELS = { icoe: "Emergency fund", expense: "Expense", homeDeposit: "Home deposit", stock: "Stock & Crypto", nowFun: "Now fun", laterFun: "Later fun", spare: "Spare" };
@@ -973,13 +1044,7 @@ function WeeklyUpdate({ data, update, dbHelpers }) {
   // Running bucket balances (same calc as Buckets page)
   const totalIncome = data.incomeEntries.reduce((s, e) => s + e.net, 0);
   const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
-  const bucketBalance = (key) => {
-    const start = data.startingBalances[key] || 0;
-    const newIncome = data.incomeEntries.filter(e => e.date > SNAPSHOT).reduce((s, e) => s + e.net, 0);
-    const allocated = (newIncome * (allocs[key] || 0)) / 100;
-    const spent = data.expenses.filter(e => e.bucket === key && e.date > SNAPSHOT).reduce((s, e) => s + e.amount, 0);
-    return start + allocated - spent;
-  };
+  const bucketBalance = (key) => getLiveBucketBalance(data, key);
 
   // Cash check: total cash minus all locked buckets = Now Fun (what you can actually spend)
   const cashEntered = parseFloat(totalCash) || 0;
@@ -1141,13 +1206,7 @@ function Expenses({ data, update, dbHelpers }) {
   const allocs = data.settings.allocations;
   const totalIncome = data.incomeEntries.reduce((s, e) => s + e.net, 0);
   const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
-  const bucketBalance = (key) => {
-    const start = data.startingBalances[key] || 0;
-    const newIncome = data.incomeEntries.filter(e => e.date > SNAPSHOT).reduce((s, e) => s + e.net, 0);
-    const allocated = (newIncome * (allocs[key] || 0)) / 100;
-    const spent = data.expenses.filter(e => e.bucket === key && e.date > SNAPSHOT).reduce((s, e) => s + e.amount, 0);
-    return start + allocated - spent;
-  };
+  const bucketBalance = (key) => getLiveBucketBalance(data, key);
 
   const handleSave = async () => {
     if (!form.bucket || !form.amount) return;
@@ -1544,14 +1603,7 @@ function Goals({ data, update }) {
   // Compute live bucket balances for linked goals
   const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const allocs = data.settings.allocations;
-  const liveBucketBalance = (key) => {
-    if (!key) return null;
-    const start = data.startingBalances[key] || 0;
-    const newIncome = data.incomeEntries.filter(e => e.date > SNAPSHOT).reduce((s, e) => s + e.net, 0);
-    const allocated = (newIncome * (allocs[key] || 0)) / 100;
-    const spent = data.expenses.filter(e => e.bucket === key && e.date > SNAPSHOT).reduce((s, e) => s + e.amount, 0);
-    return start + allocated - spent;
-  };
+  const liveBucketBalance = (key) => key ? getLiveBucketBalance(data, key) : null;
 
   const handleAdd = () => {
     if (!form.name || !form.target) return;
@@ -2047,13 +2099,55 @@ function EofyCard({ data, update }) {
 
 // ========= SETTINGS =========
 function Settings({ data, update }) {
-  const [allocs, setAllocs] = useState({ ...data.settings.allocations });
+  const [allocs, setAllocs] = useState({ ...cleanAllocations(data.settings.allocations) });
+  const [effectiveFrom, setEffectiveFrom] = useState(todayISO());
   const [saved, setSaved] = useState(false);
 
-  const total = Object.values(allocs).reduce((s, v) => s + parseFloat(v || 0), 0);
+  const total = Object.values(cleanAllocations(allocs)).reduce((s, v) => s + parseFloat(v || 0), 0);
+  const periods = getAllocationPeriods(data);
 
   const saveSettings = () => {
-    update(d => ({ ...d, settings: { ...d.settings, allocations: Object.fromEntries(Object.entries(allocs).map(([k, v]) => [k, parseFloat(v) || 0])) } }));
+    const newAllocations = cleanAllocations(allocs);
+    const effectiveDate = effectiveFrom || todayISO();
+
+    update(d => {
+      const currentBefore = cleanAllocations(d.settings.allocations);
+      const existingStoredPeriods = Array.isArray(d.pay?.allocationPeriods) ? d.pay.allocationPeriods : null;
+      const basePeriods = existingStoredPeriods && existingStoredPeriods.length
+        ? getAllocationPeriods(d)
+        : [{ id: Date.now() - 1, startDate: "0000-00-00", endDate: dayBeforeISO(effectiveDate), allocations: currentBefore }];
+
+      const futurePeriods = basePeriods
+        .filter(p => String(p.startDate) > String(effectiveDate))
+        .sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
+      const nextFutureStart = futurePeriods[0]?.startDate || null;
+
+      const updatedPeriods = basePeriods
+        .filter(p => String(p.startDate) !== String(effectiveDate))
+        .map(p => {
+          const startsBefore = String(p.startDate || "0000-00-00") < String(effectiveDate);
+          const endsAfterOrOpen = !p.endDate || String(p.endDate) >= String(effectiveDate);
+          if (startsBefore && endsAfterOrOpen) return { ...p, endDate: dayBeforeISO(effectiveDate) };
+          return p;
+        })
+        .filter(p => !p.endDate || String(p.endDate) >= String(p.startDate));
+
+      updatedPeriods.push({
+        id: Date.now(),
+        startDate: effectiveDate,
+        endDate: nextFutureStart ? dayBeforeISO(nextFutureStart) : null,
+        allocations: newAllocations,
+      });
+
+      updatedPeriods.sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
+
+      return {
+        ...d,
+        settings: { ...d.settings, allocations: newAllocations },
+        pay: { ...d.pay, allocationPeriods: updatedPeriods },
+      };
+    });
+
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
   };
@@ -2062,49 +2156,89 @@ function Settings({ data, update }) {
     <div>
       <div style={{ marginBottom: "1.5rem" }}>
         <h1 style={{ fontSize: 22, fontWeight: 500, margin: "0 0 4px" }}>Settings</h1>
-        <p style={{ color: "var(--color-text-secondary)", margin: 0, fontSize: 14 }}>Customise how your money is allocated</p>
+        <p style={{ color: "var(--color-text-secondary)", margin: 0, fontSize: 14 }}>Customise how future payslips are allocated</p>
       </div>
 
-      {/* ICOE goal banner */}
-      <div style={{ background: "#f0fdf4", border: "0.5px solid #bbf7d0", borderRadius: "var(--border-radius-lg)", padding: "1rem 1.25rem", marginBottom: "1.25rem", display: "flex", alignItems: "center", gap: 12 }}>
-        <span style={{ fontSize: 22 }}>🎯</span>
+      <div style={{ background: "#eff6ff", border: "0.5px solid #bfdbfe", borderRadius: "var(--border-radius-lg)", padding: "1rem 1.25rem", marginBottom: "1.25rem", display: "flex", alignItems: "flex-start", gap: 12 }}>
+        <span style={{ fontSize: 22 }}>ℹ️</span>
         <div>
-          <p style={{ fontSize: 13, fontWeight: 500, color: "#166534", margin: "0 0 2px" }}>ICOE goal achieved — Emergency fund complete</p>
-          <p style={{ fontSize: 12, color: "#15803d", margin: 0 }}>You hit your ~$8,000 ICOE target (roughly 6 months of support). That allocation is now $0 — your full paycheck goes to the buckets below.</p>
+          <p style={{ fontSize: 13, fontWeight: 500, color: "#1e40af", margin: "0 0 2px" }}>Allocations now only affect new payslips</p>
+          <p style={{ fontSize: 12, color: "#1d4ed8", margin: 0 }}>Changing ICOE to 0% will stop future pay going into that bucket, but it will not remove the money already sitting in ICOE. Bucket values come from your setup wizard starting balances + each payslip's allocation rule at the time + logged expenses.</p>
         </div>
       </div>
 
       <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1.25rem", marginBottom: "1.5rem" }}>
-        <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 4px" }}>Weekly income allocation (%)</h3>
-        <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: "0 0 16px" }}>These percentages determine how each paycheck is split. Total: <strong style={{ color: total === 100 ? "#22c55e" : "#ef4444" }}>{total.toFixed(1)}%</strong></p>
-        {Object.entries(allocs).map(([k, v]) => {
-          const labelMap = { expense: "Expense", homeDeposit: "Home deposit", stock: "Stock / investing", nowFun: "Now fun", laterFun: "Later fun", spare: "Spare" };
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}>
+          <div>
+            <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 4px" }}>Payslip allocation rule (%)</h3>
+            <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: 0 }}>This controls how payslips from the selected date onward are split. Total: <strong style={{ color: total === 100 ? "#22c55e" : "#ef4444" }}>{total.toFixed(1)}%</strong></p>
+          </div>
+          <span style={{ fontSize: 12, color: "var(--color-text-secondary)", whiteSpace: "nowrap" }}>{getCurrentAllocationPeriodLabel(data)}</span>
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: "block", fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 4 }}>Apply this allocation from</label>
+          <input type="date" value={effectiveFrom} onChange={e => setEffectiveFrom(e.target.value)}
+            style={{ width: "100%", maxWidth: 240, padding: "8px 12px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", fontSize: 14, background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+          <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "6px 0 0" }}>Example: set this to the date after you hit your ICOE target, then set ICOE to 0% for payslips after that date.</p>
+        </div>
+
+        {BUCKET_KEYS_GLOBAL.map(k => {
+          const v = allocs[k] || 0;
+          const labelMap = { icoe: "Emergency fund / ICOE", expense: "Expense", homeDeposit: "Home deposit", stock: "Stock / investing", nowFun: "Now fun", laterFun: "Later fun", spare: "Spare" };
           return (
-          <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12 }}>
             <label style={{ fontSize: 14, flex: 1 }}>{labelMap[k] || k}</label>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <input type="range" min={0} max={60} step={0.5} value={v}
                 onChange={e => setAllocs(p => ({ ...p, [k]: parseFloat(e.target.value) }))}
                 style={{ width: 120 }} />
-              <span style={{ fontSize: 14, fontWeight: 500, minWidth: 40, textAlign: "right" }}>{parseFloat(v).toFixed(1)}%</span>
+              <span style={{ fontSize: 14, fontWeight: 500, minWidth: 44, textAlign: "right" }}>{parseFloat(v).toFixed(1)}%</span>
             </div>
           </div>
           );
         })}
         <button onClick={saveSettings}
           style={{ marginTop: 8, padding: "8px 20px", borderRadius: "var(--border-radius-md)", background: saved ? "#22c55e" : "var(--color-background-secondary)", border: "0.5px solid var(--color-border-secondary)", cursor: "pointer", fontSize: 14, fontWeight: 500, color: saved ? "#fff" : "var(--color-text-primary)" }}>
-          {saved ? "✓ Saved" : "Save allocations"}
+          {saved ? "✓ Saved" : "Save allocation rule"}
         </button>
+      </div>
+
+      <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1.25rem", marginBottom: "1.5rem" }}>
+        <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 12px" }}>Allocation history</h3>
+        <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "0 0 12px" }}>Each payslip uses the allocation rule active on its date.</p>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead>
+              <tr style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                {["From", "To", "ICOE", "Expense", "Home", "Invest", "Now", "Later", "Spare"].map(h => <th key={h} style={{ padding: "6px 8px", textAlign: h === "From" || h === "To" ? "left" : "right", color: "var(--color-text-secondary)", fontWeight: 500 }}>{h}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {periods.map((p, i) => {
+                const a = cleanAllocations(p.allocations);
+                return (
+                  <tr key={p.id || i} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                    <td style={{ padding: "7px 8px", whiteSpace: "nowrap" }}>{p.startDate === "0000-00-00" ? "Start" : fmtDate(p.startDate)}</td>
+                    <td style={{ padding: "7px 8px", whiteSpace: "nowrap" }}>{p.endDate ? fmtDate(p.endDate) : "Current"}</td>
+                    {BUCKET_KEYS_GLOBAL.map(k => <td key={k} style={{ padding: "7px 8px", textAlign: "right" }}>{(a[k] || 0).toFixed(1)}%</td>)}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <EofyCard data={data} update={update} />
 
       <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1.25rem" }}>
         <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 12px" }}>Starting balances</h3>
-        {Object.entries(data.startingBalances).map(([k, v]) => (
+        <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "0 0 10px" }}>These are set in the setup wizard and act as the base money already inside each bucket.</p>
+        {Object.entries(data.startingBalances).filter(([k]) => typeof data.startingBalances[k] !== "object").map(([k, v]) => (
           <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
             <span style={{ fontSize: 13, color: "var(--color-text-secondary)", textTransform: "capitalize" }}>{k.replace(/([A-Z])/g, " $1")}</span>
-            <span style={{ fontSize: 13, fontWeight: 500 }}>{fmt(v, 2)}</span>
+            <span style={{ fontSize: 13, fontWeight: 500 }}>{typeof v === "number" ? fmt(v, 2) : String(v)}</span>
           </div>
         ))}
       </div>
@@ -2133,11 +2267,9 @@ function Buckets({ data }) {
   const bucketData = BUCKETS.map(b => {
     const start    = data.startingBalances[b.key] || 0;
     const allocPct = allocs[b.key] || 0;
-    // Only count income and expenses entered AFTER the snapshot
-    const newIncome = data.incomeEntries.filter(e => e.date > SNAPSHOT).reduce((s, e) => s + e.net, 0);
-    const allocated = (newIncome * allocPct) / 100;
+    const allocated = getAllocatedIncomeForBucket(data, b.key, SNAPSHOT);
     const spent    = data.expenses.filter(e => e.bucket === b.key && e.date > SNAPSHOT).reduce((s, e) => s + e.amount, 0);
-    const balance  = start + allocated - spent;
+    const balance  = getLiveBucketBalance(data, b.key);
     const weeklyAdd = (avgWeekly * allocPct) / 100;
     return { ...b, start, allocPct, allocated, spent, balance, weeklyAdd };
   });
@@ -2239,19 +2371,26 @@ function Buckets({ data }) {
 
 // ========= MONTHLY CLOSE =========
 function MonthlyClose({ data, update }) {
-  const lastReport = data.monthlyReports?.[data.monthlyReports.length - 1];
-  const prevStockTotal = lastReport?.stockTotal ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].stock;
-  const prevGoldTotal  = lastReport?.goldTotal  ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].gold;
-  const prevCryptoTotal = lastReport?.cryptoTotal ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].crypto;
-  const prevNetTotal   = lastReport?.netTotal    ?? MONTHLY_DATA[MONTHLY_DATA.length - 1].total;
+  const monthLabel = (monthStr) => {
+    const [y, m] = (monthStr || new Date().toISOString().slice(0, 7)).split("-");
+    return new Date(+y, +m - 1, 1).toLocaleDateString("en-AU", { month: "short", year: "2-digit" }).replace(" ", "-");
+  };
 
   const thisMonth = new Date().toISOString().slice(0, 7);
-  const defaultLabel = (() => {
-    const [y, m] = thisMonth.split("-");
-    return new Date(+y, +m - 1, 1).toLocaleDateString("en-AU", { month: "short", year: "2-digit" }).replace(" ", "-");
-  })();
-
   const [month, setMonth] = useState(thisMonth);
+  const selectedLabel = monthLabel(month);
+
+  // Use the latest locked report BEFORE the selected month as the comparison point.
+  // This means choosing a reporting month actually changes the month being reported,
+  // and the first-ever report becomes a baseline rather than a fake growth month.
+  const sortedReports = [...(data.monthlyReports || [])].sort((a, b) => a.month.localeCompare(b.month));
+  const previousReports = sortedReports.filter(r => r.month < month);
+  const lastReport = previousReports[previousReports.length - 1] || null;
+  const hasPreviousReport = !!lastReport;
+  const prevStockTotal = hasPreviousReport ? (lastReport.stockTotal || 0) : 0;
+  const prevGoldTotal  = hasPreviousReport ? (lastReport.goldTotal || 0) : 0;
+  const prevCryptoTotal = hasPreviousReport ? (lastReport.cryptoTotal || 0) : 0;
+  const prevNetTotal   = hasPreviousReport ? (lastReport.netTotal || 0) : 0;
   const [stockTotal, setStockTotal] = useState("");
   const [goldTotal, setGoldTotal] = useState("");
   const [cryptoTotal, setCryptoTotal] = useState("");
@@ -2270,47 +2409,57 @@ function MonthlyClose({ data, update }) {
   const cTotal = parseFloat(cryptoTotal) || 0;
   const cashT  = parseFloat(cashTotal) || 0;
 
-  const stockDiff      = sTotal - prevStockTotal;
-  const stockGrowth    = stockDiff - stockSpentThisMonth;
-  const stockGrowthPct = prevStockTotal > 0 ? (stockGrowth / prevStockTotal) * 100 : 0;
-  const prevStockProfit = data.monthlyReports.reduce((s, r) => s + (r.stockGrowth || 0), 0);
-  const totalStockProfit = prevStockProfit + stockGrowth;
+  const stockDiff      = hasPreviousReport ? sTotal - prevStockTotal : 0;
+  const stockGrowth    = hasPreviousReport ? stockDiff - stockSpentThisMonth : null;
+  const stockGrowthPct = hasPreviousReport && prevStockTotal > 0 ? (stockGrowth / prevStockTotal) * 100 : null;
+  const prevStockProfit = previousReports.reduce((s, r) => s + (r.stockGrowth || 0), 0);
+  const totalStockProfit = prevStockProfit + (stockGrowth || 0);
 
-  const goldDiff      = gTotal - prevGoldTotal;
-  const goldGrowthPct = prevGoldTotal > 0 ? (goldDiff / prevGoldTotal) * 100 : 0;
+  const goldDiff      = hasPreviousReport ? gTotal - prevGoldTotal : 0;
+  const goldGrowthPct = hasPreviousReport && prevGoldTotal > 0 ? (goldDiff / prevGoldTotal) * 100 : null;
 
-  const cryptoDiff      = cTotal - prevCryptoTotal;
-  const cryptoGrowthPct = prevCryptoTotal > 0 ? (cryptoDiff / prevCryptoTotal) * 100 : 0;
+  const cryptoDiff      = hasPreviousReport ? cTotal - prevCryptoTotal : 0;
+  const cryptoGrowthPct = hasPreviousReport && prevCryptoTotal > 0 ? (cryptoDiff / prevCryptoTotal) * 100 : null;
 
-  const investGrowth = stockGrowth + goldDiff + cryptoDiff;
+  const investGrowth = hasPreviousReport ? (stockGrowth || 0) + goldDiff + cryptoDiff : null;
   const newTotal     = (sTotal || prevStockTotal) + (gTotal || prevGoldTotal) + (cTotal || prevCryptoTotal) + cashT;
-  const balanceGrowth = newTotal - prevNetTotal;
-  const growthPct     = prevNetTotal > 0 ? (balanceGrowth / prevNetTotal) * 100 : 0;
+  const balanceGrowth = hasPreviousReport ? newTotal - prevNetTotal : null;
+  const growthPct     = hasPreviousReport && prevNetTotal > 0 ? (balanceGrowth / prevNetTotal) * 100 : null;
+
+  const safeFixed = (v, digits = 2) => v === null || v === undefined || isNaN(v) ? null : parseFloat(v.toFixed(digits));
 
   const handleSave = () => {
-    if (!stockTotal && !goldTotal && !cryptoTotal) return;
+    if (!stockTotal && !goldTotal && !cryptoTotal && !cashTotal) return;
+    const existingReport = (data.monthlyReports || []).find(r => r.month === month);
     const report = {
-      id: Date.now(),
+      id: existingReport?.id || Date.now(),
       month,
-      label: defaultLabel,
+      label: selectedLabel,
+      isBaseline: !hasPreviousReport,
       stockTotal: sTotal || prevStockTotal,
       goldTotal:  gTotal || prevGoldTotal,
       cryptoTotal: cTotal || prevCryptoTotal,
       cashTotal:  cashT,
       stockSpent: stockSpentThisMonth,
-      stockGrowth,
-      stockGrowthPct: parseFloat(stockGrowthPct.toFixed(2)),
-      totalStockProfit: parseFloat(totalStockProfit.toFixed(2)),
-      goldGrowth: goldDiff,
-      goldGrowthPct: parseFloat(goldGrowthPct.toFixed(2)),
-      cryptoGrowth: cryptoDiff,
-      cryptoGrowthPct: parseFloat(cryptoGrowthPct.toFixed(2)),
-      investGrowth: parseFloat(investGrowth.toFixed(2)),
-      netTotal: parseFloat(newTotal.toFixed(2)),
-      balanceGrowth: parseFloat(balanceGrowth.toFixed(2)),
-      growthPct: parseFloat(growthPct.toFixed(2)),
+      stockGrowth: safeFixed(stockGrowth),
+      stockGrowthPct: safeFixed(stockGrowthPct),
+      totalStockProfit: safeFixed(totalStockProfit),
+      goldGrowth: safeFixed(hasPreviousReport ? goldDiff : null),
+      goldGrowthPct: safeFixed(goldGrowthPct),
+      cryptoGrowth: safeFixed(hasPreviousReport ? cryptoDiff : null),
+      cryptoGrowthPct: safeFixed(cryptoGrowthPct),
+      investGrowth: safeFixed(investGrowth),
+      netTotal: safeFixed(newTotal),
+      balanceGrowth: safeFixed(balanceGrowth),
+      growthPct: safeFixed(growthPct),
     };
-    update(d => ({ ...d, monthlyReports: [...(d.monthlyReports || []), report] }));
+    update(d => ({
+      ...d,
+      monthlyReports: [
+        ...(d.monthlyReports || []).filter(r => r.month !== month),
+        report
+      ].sort((a, b) => a.month.localeCompare(b.month))
+    }));
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
     setStockTotal(""); setGoldTotal(""); setCryptoTotal(""); setCashTotal("");
@@ -2318,11 +2467,16 @@ function MonthlyClose({ data, update }) {
 
   const handleDelete = (id) => update(d => ({ ...d, monthlyReports: d.monthlyReports.filter(r => r.id !== id) }));
 
-  const GreenRed = ({ v, suffix = "" }) => (
-    <span style={{ color: v >= 0 ? "#22c55e" : "#ef4444", fontWeight: 500 }}>
-      {v >= 0 ? "+" : ""}{fmt(v, 2)}{suffix}
-    </span>
-  );
+  const GreenRed = ({ v, suffix = "" }) => {
+    if (v === null || v === undefined || isNaN(v)) {
+      return <span style={{ color: "var(--color-text-secondary)", fontWeight: 500 }}>Baseline</span>;
+    }
+    return (
+      <span style={{ color: v >= 0 ? "#22c55e" : "#ef4444", fontWeight: 500 }}>
+        {v >= 0 ? "+" : ""}{fmt(v, 2)}{suffix}
+      </span>
+    );
+  };
 
   const TabBtn = ({ id, label }) => (
     <button onClick={() => setActiveTab(id)} style={{ padding: "7px 16px", borderRadius: "var(--border-radius-md)", border: "none", cursor: "pointer", fontSize: 13, fontWeight: activeTab === id ? 500 : 400, background: activeTab === id ? "#3b82f6" : "var(--color-background-secondary)", color: activeTab === id ? "#fff" : "var(--color-text-secondary)" }}>
@@ -2367,7 +2521,7 @@ function MonthlyClose({ data, update }) {
               </div>
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "10px 12px" }}>
                 <p style={{ margin: "0 0 4px" }}>Stock/crypto spent this month (from expenses): <strong style={{ color: "#3b82f6" }}>{fmt(stockSpentThisMonth, 2)}</strong></p>
-                <p style={{ margin: 0, fontSize: 11 }}>This is automatically pulled from your Stock & Crypto expense bucket for {defaultLabel}</p>
+                <p style={{ margin: 0, fontSize: 11 }}>This is automatically pulled from your Stock & Crypto expense bucket for {selectedLabel}</p>
               </div>
             </div>
 
@@ -2410,7 +2564,7 @@ function MonthlyClose({ data, update }) {
                     </tr>
                   </thead>
                   <tbody>
-                    {data.monthlyReports.map(r => (
+                    {sortedReports.map(r => (
                       <tr key={r.id} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                         <td style={{ padding: "7px 8px", fontWeight: 500 }}>{r.label}</td>
                         <td style={{ padding: "7px 8px", textAlign: "right" }}>{fmt(r.stockTotal, 2)}</td>
@@ -2460,7 +2614,7 @@ function MonthlyClose({ data, update }) {
             {data.monthlyReports?.length > 0 && (
               <div style={{ marginTop: 16 }}>
                 <p style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>Gold history</p>
-                {data.monthlyReports.map(r => (
+                {sortedReports.map(r => (
                   <div key={r.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                     <span style={{ color: "var(--color-text-secondary)" }}>{r.label}</span>
                     <span>{fmt(r.goldTotal, 2)}</span>
@@ -2506,7 +2660,7 @@ function MonthlyClose({ data, update }) {
             {data.monthlyReports?.length > 0 && (
               <div style={{ marginTop: 16 }}>
                 <p style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>Crypto history</p>
-                {data.monthlyReports.map(r => (
+                {sortedReports.map(r => (
                   <div key={r.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                     <span style={{ color: "var(--color-text-secondary)" }}>{r.label}</span>
                     <span>{fmt(r.cryptoTotal, 2)}</span>
@@ -2524,7 +2678,7 @@ function MonthlyClose({ data, update }) {
       {activeTab === "summary" && (
         <div>
           <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1.25rem", marginBottom: "1.25rem" }}>
-            <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 4px" }}>End of month summary — {defaultLabel}</h3>
+            <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 4px" }}>End of month summary — {selectedLabel}</h3>
             <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "0 0 16px" }}>Fill in stocks, gold and crypto tabs first, then add your total cash to lock in the month.</p>
 
             <div style={{ marginBottom: 16 }}>
@@ -2550,7 +2704,7 @@ function MonthlyClose({ data, update }) {
                 <span style={{ color: "#22c55e" }}>{fmt(newTotal, 2)}</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
-                <span style={{ color: "var(--color-text-secondary)" }}>Balance change from {lastReport?.label || "May-26"}</span>
+                <span style={{ color: "var(--color-text-secondary)" }}>Balance change from {hasPreviousReport ? lastReport.label : "baseline month"}</span>
                 <GreenRed v={balanceGrowth} />
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
@@ -2588,7 +2742,7 @@ function MonthlyClose({ data, update }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.monthlyReports.map(r => (
+                  {sortedReports.map(r => (
                     <tr key={r.id} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                       <td style={{ padding: "7px 8px", fontWeight: 500 }}>{r.label}</td>
                       <td style={{ padding: "7px 8px", textAlign: "right" }}>{fmt(r.stockTotal, 2)}</td>
@@ -2596,9 +2750,9 @@ function MonthlyClose({ data, update }) {
                       <td style={{ padding: "7px 8px", textAlign: "right" }}>{fmt(r.cryptoTotal, 2)}</td>
                       <td style={{ padding: "7px 8px", textAlign: "right" }}>{fmt(r.cashTotal, 2)}</td>
                       <td style={{ padding: "7px 8px", textAlign: "right", fontWeight: 500 }}>{fmt(r.netTotal, 2)}</td>
-                      <td style={{ padding: "7px 8px", textAlign: "right", color: r.investGrowth >= 0 ? "#22c55e" : "#ef4444" }}>{r.investGrowth >= 0 ? "+" : ""}{fmt(r.investGrowth, 2)}</td>
-                      <td style={{ padding: "7px 8px", textAlign: "right", color: r.balanceGrowth >= 0 ? "#22c55e" : "#ef4444" }}>{r.balanceGrowth >= 0 ? "+" : ""}{fmt(r.balanceGrowth, 2)}</td>
-                      <td style={{ padding: "7px 8px", textAlign: "right", fontWeight: 500, color: r.growthPct >= 0 ? "#22c55e" : "#ef4444" }}>{r.growthPct >= 0 ? "+" : ""}{r.growthPct?.toFixed(2)}%</td>
+                      <td style={{ padding: "7px 8px", textAlign: "right", color: r.investGrowth === null || r.investGrowth === undefined ? "var(--color-text-secondary)" : r.investGrowth >= 0 ? "#22c55e" : "#ef4444" }}>{r.investGrowth === null || r.investGrowth === undefined ? "Baseline" : (r.investGrowth >= 0 ? "+" : "") + fmt(r.investGrowth, 2)}</td>
+                      <td style={{ padding: "7px 8px", textAlign: "right", color: r.balanceGrowth === null || r.balanceGrowth === undefined ? "var(--color-text-secondary)" : r.balanceGrowth >= 0 ? "#22c55e" : "#ef4444" }}>{r.balanceGrowth === null || r.balanceGrowth === undefined ? "Baseline" : (r.balanceGrowth >= 0 ? "+" : "") + fmt(r.balanceGrowth, 2)}</td>
+                      <td style={{ padding: "7px 8px", textAlign: "right", fontWeight: 500, color: r.growthPct === null || r.growthPct === undefined ? "var(--color-text-secondary)" : r.growthPct >= 0 ? "#22c55e" : "#ef4444" }}>{r.growthPct === null || r.growthPct === undefined ? "Baseline" : (r.growthPct >= 0 ? "+" : "") + r.growthPct.toFixed(2) + "%"}</td>
                       <td style={{ padding: "7px 8px" }}>
                         <button onClick={() => handleDelete(r.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--color-text-secondary)", fontSize: 14 }}>×</button>
                       </td>
@@ -2682,9 +2836,11 @@ function SetupWizard({ data, update, dbHelpers, onFinish, onCancel }) {
     balances.gold = cleanAssets.filter(a => (a.type || "").toLowerCase().includes("gold") || (a.asset || "").toLowerCase().includes("gold")).reduce((s, a) => s + a.units * a.price, 0);
     balances.isSnapshot = true;
 
+    const setupAllocations = cleanAllocations(allocs);
+
     update(d => ({
       ...d,
-      settings: { ...d.settings, allocations: Object.fromEntries(Object.entries(allocs).map(([k, v]) => [k, parseFloat(v) || 0])) },
+      settings: { ...d.settings, allocations: setupAllocations },
       startingBalances: { ...d.startingBalances, ...balances },
       portfolio: cleanAssets,
       pay: {
@@ -2693,6 +2849,7 @@ function SetupWizard({ data, update, dbHelpers, onFinish, onCancel }) {
         regularPayAmount: payAmount,
         nextPayDate,
         recurringExpenses: cleanExpenses,
+        allocationPeriods: [{ id: Date.now(), startDate: "0000-00-00", endDate: null, allocations: setupAllocations }],
         onboardingComplete: true,
       },
       goals: (d.goals || []).map(g => ({ ...g, current: g.bucketKey ? (balances[g.bucketKey] || 0) : g.current }))
