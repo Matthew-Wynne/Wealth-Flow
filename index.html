@@ -2235,12 +2235,18 @@ function Settings({ data, update }) {
       <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1.25rem" }}>
         <h3 style={{ fontSize: 14, fontWeight: 500, margin: "0 0 12px" }}>Starting balances</h3>
         <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "0 0 10px" }}>These are set in the setup wizard and act as the base money already inside each bucket.</p>
-        {Object.entries(data.startingBalances).filter(([k]) => typeof data.startingBalances[k] !== "object").map(([k, v]) => (
-          <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-            <span style={{ fontSize: 13, color: "var(--color-text-secondary)", textTransform: "capitalize" }}>{k.replace(/([A-Z])/g, " $1")}</span>
-            <span style={{ fontSize: 13, fontWeight: 500 }}>{typeof v === "number" ? fmt(v, 2) : String(v)}</span>
-          </div>
-        ))}
+        {BUCKET_KEYS_GLOBAL.map(k => {
+          const v = data.startingBalances?.[k] || 0;
+          return (
+            <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+              <span style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>{BUCKET_LABELS_GLOBAL[k]}</span>
+              <span style={{ fontSize: 13, fontWeight: 500 }}>{fmt(v, 2)}</span>
+            </div>
+          );
+        })}
+        {data.startingBalances?.snapshotDate && data.startingBalances.snapshotDate !== "0000-00-00" && (
+          <p style={{ fontSize: 11, color: "var(--color-text-secondary)", margin: "10px 0 0" }}>Bucket base set on {fmtDate(data.startingBalances.snapshotDate)}. Older transactions are treated as already included in these balances.</p>
+        )}
       </div>
     </div>
   );
@@ -2791,7 +2797,7 @@ function SetupWizard({ data, update, dbHelpers, onFinish, onCancel }) {
   ]);
   const [allocs, setAllocs] = useState({ ...data.settings.allocations });
   const [totalCash, setTotalCash] = useState("");
-  const [bucketBalances, setBucketBalances] = useState({ ...data.startingBalances });
+  const [bucketBalances, setBucketBalances] = useState(() => Object.fromEntries(BUCKET_KEYS_GLOBAL.map(k => [k, data.startingBalances?.[k] ?? 0])));
   const [assets, setAssets] = useState(data.portfolio?.length ? data.portfolio : [
     { id: Date.now(), asset: "", type: "ETF", units: "", price: "", costBasis: "" }
   ]);
@@ -2830,18 +2836,23 @@ function SetupWizard({ data, update, dbHelpers, onFinish, onCancel }) {
         price: parseFloat(a.price) || 0,
         costBasis: parseFloat(a.costBasis) || 0,
       }));
-    const balances = Object.fromEntries(Object.entries(bucketBalances).map(([k, v]) => [k, parseFloat(v) || 0]));
+    const balances = Object.fromEntries(BUCKET_KEYS_GLOBAL.map(k => [k, parseFloat(bucketBalances[k]) || 0]));
+    const snapshotDate = todayISO();
     const assetTotal = cleanAssets.reduce((s, a) => s + a.units * a.price, 0);
     balances.total = cashBucketTotal + assetTotal;
     balances.gold = cleanAssets.filter(a => (a.type || "").toLowerCase().includes("gold") || (a.asset || "").toLowerCase().includes("gold")).reduce((s, a) => s + a.units * a.price, 0);
     balances.isSnapshot = true;
+    // Treat the setup wizard values as the new current bucket base.
+    // Past income/expenses are already reflected in these manual amounts, so only
+    // transactions after this date should be added/subtracted from buckets.
+    balances.snapshotDate = snapshotDate;
 
     const setupAllocations = cleanAllocations(allocs);
 
     update(d => ({
       ...d,
       settings: { ...d.settings, allocations: setupAllocations },
-      startingBalances: { ...d.startingBalances, ...balances },
+      startingBalances: { ...initialState.startingBalances, ...balances },
       portfolio: cleanAssets,
       pay: {
         ...d.pay,
@@ -2849,7 +2860,7 @@ function SetupWizard({ data, update, dbHelpers, onFinish, onCancel }) {
         regularPayAmount: payAmount,
         nextPayDate,
         recurringExpenses: cleanExpenses,
-        allocationPeriods: [{ id: Date.now(), startDate: "0000-00-00", endDate: null, allocations: setupAllocations }],
+        allocationPeriods: [{ id: Date.now(), startDate: snapshotDate, endDate: null, allocations: setupAllocations }],
         onboardingComplete: true,
       },
       goals: (d.goals || []).map(g => ({ ...g, current: g.bucketKey ? (balances[g.bucketKey] || 0) : g.current }))
