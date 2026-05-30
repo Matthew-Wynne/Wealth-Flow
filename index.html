@@ -717,7 +717,7 @@ function Dashboard({ data }) {
   };
 
   // ── Build live monthly data — prefer monthlyReports when available ──────
-  const SNAPSHOT = "2026-05-14";
+  const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const portfolioValue = data.portfolio.reduce((s, h) => s + h.units * h.price, 0);
 
   // Months that have a locked monthly report take priority
@@ -957,10 +957,11 @@ function WeeklyUpdate({ data, update, dbHelpers }) {
   const allocs = data.settings.allocations;
   const net = parseFloat(pay) || 0;
 
-  const BUCKET_LABELS = { expense: "Expense", homeDeposit: "Home deposit", stock: "Stock & Crypto", nowFun: "Now fun", laterFun: "Later fun", spare: "Spare" };
-  const BUCKET_COLORS = { expense: "#ef4444", homeDeposit: "#8b5cf6", stock: "#3b82f6", nowFun: "#ec4899", laterFun: "#a855f7", spare: "#14b8a6" };
+  const BUCKET_LABELS = { icoe: "Emergency fund", expense: "Expense", homeDeposit: "Home deposit", stock: "Stock & Crypto", nowFun: "Now fun", laterFun: "Later fun", spare: "Spare" };
+  const BUCKET_COLORS = { icoe: "#22c55e", expense: "#ef4444", homeDeposit: "#8b5cf6", stock: "#3b82f6", nowFun: "#ec4899", laterFun: "#a855f7", spare: "#14b8a6" };
 
   const breakdown = {
+    icoe:        (net * (allocs.icoe || 0)) / 100,
     expense:     (net * allocs.expense) / 100,
     homeDeposit: (net * allocs.homeDeposit) / 100,
     stock:       (net * allocs.stock) / 100,
@@ -971,7 +972,7 @@ function WeeklyUpdate({ data, update, dbHelpers }) {
 
   // Running bucket balances (same calc as Buckets page)
   const totalIncome = data.incomeEntries.reduce((s, e) => s + e.net, 0);
-  const SNAPSHOT = "2026-05-14";
+  const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const bucketBalance = (key) => {
     const start = data.startingBalances[key] || 0;
     const newIncome = data.incomeEntries.filter(e => e.date > SNAPSHOT).reduce((s, e) => s + e.net, 0);
@@ -1139,7 +1140,7 @@ function Expenses({ data, update, dbHelpers }) {
 
   const allocs = data.settings.allocations;
   const totalIncome = data.incomeEntries.reduce((s, e) => s + e.net, 0);
-  const SNAPSHOT = "2026-05-14";
+  const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const bucketBalance = (key) => {
     const start = data.startingBalances[key] || 0;
     const newIncome = data.incomeEntries.filter(e => e.date > SNAPSHOT).reduce((s, e) => s + e.net, 0);
@@ -1148,18 +1149,43 @@ function Expenses({ data, update, dbHelpers }) {
     return start + allocated - spent;
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.bucket || !form.amount) return;
-    const newExp = { ...form, id: Date.now(), amount: parseFloat(form.amount), category: form.bucket, description: "" };
-    update(d => ({ ...d, expenses: [...d.expenses, newExp] }));
-    if (dbHelpers?.saveExpense) dbHelpers.saveExpense(newExp);
+    const tempExp = { ...form, id: Date.now(), amount: parseFloat(form.amount), category: form.bucket, description: "" };
+
+    // Save to Supabase first when available so the local row uses the real database id.
+    // This keeps future delete/edit operations aligned with stored user data.
+    let savedExp = tempExp;
+    if (dbHelpers?.saveExpense) {
+      try {
+        const row = await dbHelpers.saveExpense(tempExp);
+        if (row) {
+          savedExp = {
+            id: row.id,
+            date: row.date,
+            amount: parseFloat(row.amount) || tempExp.amount,
+            bucket: row.bucket,
+            category: row.category || row.bucket,
+            description: row.description || "",
+            notes: row.notes || "",
+          };
+        }
+      } catch (err) {
+        console.error("Expense save failed", err);
+      }
+    }
+
+    update(d => ({ ...d, expenses: [...d.expenses, savedExp] }));
     setSaved(true);
     setShowForm(false);
     setForm({ date: new Date().toISOString().slice(0, 10), bucket: "", amount: "", notes: "" });
     setTimeout(() => setSaved(false), 2500);
   };
 
-  const handleDelete = (id) => update(d => ({ ...d, expenses: d.expenses.filter(e => e.id !== id) }));
+  const handleDelete = (id) => {
+    update(d => ({ ...d, expenses: d.expenses.filter(e => e.id !== id) }));
+    if (dbHelpers?.deleteExpense) dbHelpers.deleteExpense(id);
+  };
 
   // Monthly tracker — group expenses by month and bucket
   const months = [...new Set(data.expenses.map(e => e.date.slice(0,7)))].sort().reverse();
@@ -1516,7 +1542,7 @@ function Goals({ data, update }) {
   const [form, setForm] = useState({ name: "", target: "", current: "", targetDate: "", category: "Saving" });
 
   // Compute live bucket balances for linked goals
-  const SNAPSHOT = "2026-05-14";
+  const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const allocs = data.settings.allocations;
   const liveBucketBalance = (key) => {
     if (!key) return null;
@@ -2103,7 +2129,7 @@ function Buckets({ data }) {
   const avgWeekly = data.incomeEntries.length ? totalIncome / data.incomeEntries.length : 0;
 
   // Snapshot date — balances already include all history up to this date
-  const SNAPSHOT = "2026-05-14";
+  const SNAPSHOT = data.startingBalances?.snapshotDate || "0000-00-00";
   const bucketData = BUCKETS.map(b => {
     const start    = data.startingBalances[b.key] || 0;
     const allocPct = allocs[b.key] || 0;
@@ -2121,7 +2147,10 @@ function Buckets({ data }) {
   // Now Fun uses saved cash check result if available, otherwise falls back to bucket calc
   const cashCheck = data.lastCashCheck;
   const nowFunBucket = bucketData.find(b => b.key === "nowFun");
-  const nowFunDisplay = cashCheck?.nowFunAvailable != null ? cashCheck.nowFunAvailable : nowFunBucket?.balance;
+  // Always show the live calculated bucket balance here.
+  // A saved cash check is only informational; it should not override bucket balances
+  // because it becomes stale as soon as income or expenses are logged.
+  const nowFunDisplay = nowFunBucket?.balance;
   const hasCashCheck = cashCheck?.nowFunAvailable != null;
 
   return (
@@ -2137,13 +2166,13 @@ function Buckets({ data }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
             <div>
               <p style={{ fontSize: 11, color: nowFunDisplay >= 0 ? "#9d174d" : "#991b1b", margin: "0 0 4px", textTransform: "uppercase", letterSpacing: "0.07em" }}>
-                Now fun — {hasCashCheck ? "available to spend" : "bucket balance"}
+                Now fun — bucket balance
               </p>
               <p style={{ fontSize: 40, fontWeight: 500, margin: "0 0 4px", letterSpacing: "-1px", color: nowFunDisplay >= 0 ? "#ec4899" : "#ef4444" }}>{fmt(nowFunDisplay, 2)}</p>
               <p style={{ fontSize: 12, color: nowFunDisplay >= 0 ? "#9d174d" : "#991b1b", margin: 0 }}>
                 {hasCashCheck
-                  ? `From cash check on ${fmtDate(cashCheck.date)} — total cash ${fmt(cashCheck.totalCash, 2)} minus all committed buckets`
-                  : "Do a cash check in Weekly Update to see your real spending money"}
+                  ? `Latest cash check: ${fmt(cashCheck.nowFunAvailable, 2)} available on ${fmtDate(cashCheck.date)}. This card shows your live bucket balance after logged expenses.`
+                  : "Do a cash check in Weekly Update to compare this with your actual cash balance."}
               </p>
             </div>
             <span style={{ fontSize: 32, opacity: 0.3 }}>&#9829;</span>
@@ -2168,8 +2197,8 @@ function Buckets({ data }) {
       {/* Bucket cards */}
       <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: "1.25rem" }}>
         {bucketData.map(b => {
-          // Now Fun shows cash-check value if available
-          const displayBalance = (b.key === "nowFun" && hasCashCheck) ? cashCheck.nowFunAvailable : b.balance;
+          // Bucket cards always show live bucket balances after logged expenses.
+          const displayBalance = b.balance;
           const pos = displayBalance >= 0;
           const pctOfTotal = totalBalance > 0 ? (Math.max(displayBalance, 0) / totalBalance) * 100 : 0;
           const isNowFun = b.key === "nowFun";
@@ -2181,7 +2210,7 @@ function Buckets({ data }) {
                   <div>
                     <p style={{ fontSize: 14, fontWeight: 500, margin: "0 0 2px" }}>{b.label}</p>
                     <p style={{ fontSize: 11, color: "var(--color-text-secondary)", margin: 0 }}>
-                      {isNowFun && hasCashCheck ? "From latest cash check" : b.desc}
+                      {b.desc}
                     </p>
                   </div>
                 </div>
